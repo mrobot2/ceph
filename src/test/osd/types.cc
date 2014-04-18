@@ -192,6 +192,9 @@ TEST(pg_interval_t, check_new_interval)
     lastmap->set_max_osd(10);
     lastmap->set_state(osd_id, CEPH_OSD_EXISTS);
     lastmap->set_epoch(epoch);
+    OSDMap::Incremental inc(epoch + 1);
+    inc.new_pools[pool_id];
+    lastmap->apply_incremental(inc);
 
     map<epoch_t, pg_interval_t> past_intervals;
 
@@ -308,6 +311,46 @@ TEST(pg_interval_t, check_new_interval)
 						  lastmap,
 						  pool_id,
 						  pgid,
+						  &past_intervals));
+    ASSERT_EQ((unsigned int)1, past_intervals.size());
+    ASSERT_EQ(same_interval_since, past_intervals[same_interval_since].first);
+    ASSERT_EQ(osdmap->get_epoch() - 1, past_intervals[same_interval_since].last);
+    ASSERT_EQ(osd_id, past_intervals[same_interval_since].acting[0]);
+    ASSERT_EQ(osd_id, past_intervals[same_interval_since].up[0]);
+  }
+
+  //
+  // PG is splitting (in the past)
+  //
+  if (false) {
+    ceph::shared_ptr<OSDMap> osdmap(new OSDMap());
+    osdmap->set_max_osd(10);
+    osdmap->set_state(osd_id, CEPH_OSD_EXISTS);
+    osdmap->set_epoch(epoch);
+    int new_pg_num = pg_num ^ 2;
+    OSDMap::Incremental inc(epoch + 1);
+    inc.new_pools[pool_id].min_size = min_size;
+    inc.new_pools[pool_id].set_pg_num(new_pg_num);
+    osdmap->apply_incremental(inc);
+
+    map<epoch_t, pg_interval_t> past_intervals;
+
+    pg_t future_pgid = pgid;
+    future_pgid.m_seed = 1234;
+
+    ASSERT_TRUE(past_intervals.empty());
+    ASSERT_TRUE(pg_interval_t::check_new_interval(old_primary,
+						  new_primary,
+						  old_acting,
+						  new_acting,
+						  old_up,
+						  new_up,
+						  same_interval_since,
+						  last_epoch_clean,
+						  osdmap,
+						  lastmap,
+						  pool_id,
+						  future_pgid,
 						  &past_intervals));
     ASSERT_EQ((unsigned int)1, past_intervals.size());
     ASSERT_EQ(same_interval_since, past_intervals[same_interval_since].first);

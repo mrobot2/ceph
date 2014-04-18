@@ -2173,13 +2173,14 @@ bool pg_interval_t::check_new_interval(
   std::ostream *out)
 {
   // remember past interval
+  unsigned old_pg_num = lastmap->get_pg_num(pgid.pool());
+  unsigned new_pg_num = osdmap->get_pg_num(pgid.pool());
   if (old_primary != new_primary ||
       new_acting != old_acting || new_up != old_up ||
       (!(lastmap->get_pools().count(pool_id))) ||
       (lastmap->get_pools().find(pool_id)->second.min_size !=
        osdmap->get_pools().find(pool_id)->second.min_size)  ||
-      pgid.is_split(lastmap->get_pg_num(pgid.pool()),
-        osdmap->get_pg_num(pgid.pool()), 0)) {
+      pgid.get_ancestor(new_pg_num).is_split(old_pg_num, new_pg_num, 0)) {
     pg_interval_t& i = (*past_intervals)[same_interval_since];
     i.first = same_interval_since;
     i.last = osdmap->get_epoch() - 1;
