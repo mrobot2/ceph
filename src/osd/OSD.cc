@@ -1009,6 +1009,8 @@ bool OSD::asok_command(string command, cmdmap_t& cmdmap, string format,
     f->dump_unsigned("num_pgs", pg_map.size());
     osd_lock.Unlock();
     f->close_section();
+  } else if (command == "flush_journal") {
+    store->sync_and_flush();
   } else if (command == "dump_ops_in_flight") {
     op_tracker.dump_ops_in_flight(f);
   } else if (command == "dump_historic_ops") {
@@ -1296,6 +1298,10 @@ void OSD::final_init()
   asok_hook = new OSDSocketHook(this);
   r = admin_socket->register_command("status", "status", asok_hook,
 				     "high-level status of OSD");
+  assert(r == 0);
+  r = admin_socket->register_command("flush_journal", "flush_journal",
+                                     asok_hook,
+                                     "flush the journal to permanent store");
   assert(r == 0);
   r = admin_socket->register_command("dump_ops_in_flight",
 				     "dump_ops_in_flight", asok_hook,
@@ -1590,6 +1596,7 @@ int OSD::shutdown()
 
   // unregister commands
   cct->get_admin_socket()->unregister_command("status");
+  cct->get_admin_socket()->unregister_command("flush_journal");
   cct->get_admin_socket()->unregister_command("dump_ops_in_flight");
   cct->get_admin_socket()->unregister_command("dump_historic_ops");
   cct->get_admin_socket()->unregister_command("dump_op_pq_state");
@@ -2108,8 +2115,6 @@ void OSD::load_pgs()
 
     service.init_splits_between(pg->info.pgid, pg->get_osdmap(), osdmap);
 
-    pg->reg_next_scrub();
-
     // generate state for PG's current mapping
     int primary, up_primary;
     vector<int> acting, up;
@@ -2122,6 +2127,8 @@ void OSD::load_pgs()
       primary);
     int role = OSDMap::calc_pg_role(whoami, pg->acting);
     pg->set_role(role);
+
+    pg->reg_next_scrub();
 
     PG::RecoveryCtx rctx(0, 0, 0, 0, 0, 0);
     pg->handle_loaded(&rctx);
@@ -3005,9 +3012,9 @@ void OSD::handle_osd_ping(MOSDPing *m)
     break;
 
   case MOSDPing::YOU_DIED:
-    dout(10) << "handle_osd_ping " << m->get_source_inst() << " says i am down in " << m->map_epoch
-	     << dendl;
-    osdmap_subscribe(m->map_epoch, false);
+    dout(10) << "handle_osd_ping " << m->get_source_inst()
+	     << " says i am down in " << m->map_epoch << dendl;
+    osdmap_subscribe(curmap->get_epoch()+1, false);
     break;
   }
 
@@ -3845,7 +3852,10 @@ void OSDService::send_message_osd_cluster(int peer, Message *m, epoch_t from_epo
     m->put();
     return;
   }
-  osd->cluster_messenger->send_message(m, next_osdmap->get_cluster_inst(peer));
+  const entity_inst_t& peer_inst = next_osdmap->get_cluster_inst(peer);
+  Connection *peer_con = osd->cluster_messenger->get_connection(peer_inst).get();
+  osd->_share_map_outgoing(peer, peer_con, next_osdmap);
+  osd->cluster_messenger->send_message(m, peer_inst);
 }
 
 ConnectionRef OSDService::get_con_osd_cluster(int peer, epoch_t from_epoch)
@@ -4168,7 +4178,7 @@ COMMAND("reset_pg_recovery_stats", "reset pg recovery statistics",
 	"osd", "rw", "cli,rest")
 };
 
-void OSD::do_command(Connection *con, tid_t tid, vector<string>& cmd, bufferlist& data)
+void OSD::do_command(Connection *con, ceph_tid_t tid, vector<string>& cmd, bufferlist& data)
 {
   int r = 0;
   stringstream ss, ds;
@@ -4269,10 +4279,23 @@ void OSD::do_command(Connection *con, tid_t tid, vector<string>& cmd, bufferlist
 	  _have_pg(pcand)) {
 	PG *pg = _lookup_lock_pg(pcand);
 	assert(pg);
-	// simulate pg <pgid> cmd= for pg->do-command
-	if (prefix != "pg")
-	  cmd_putval(cct, cmdmap, "cmd", prefix);
-	r = pg->do_command(cmdmap, ss, data, odata);
+	if (pg->is_primary()) {
+	  // simulate pg <pgid> cmd= for pg->do-command
+	  if (prefix != "pg")
+	    cmd_putval(cct, cmdmap, "cmd", prefix);
+	  r = pg->do_command(cmdmap, ss, data, odata);
+	} else {
+	  ss << "not primary for pgid " << pgid;
+
+	  // send them the latest diff to ensure they realize the mapping
+	  // has changed.
+	  send_incremental_map(osdmap->get_epoch() - 1, con);
+
+	  // do not reply; they will get newer maps and realize they
+	  // need to resend.
+	  pg->unlock();
+	  return;
+	}
 	pg->unlock();
       } else {
 	ss << "i don't have pgid " << pgid;
@@ -5657,9 +5680,9 @@ void OSD::check_osdmap_features(ObjectStore *fs)
 	!fs->get_allow_sharded_objects()) {
     dout(0) << __func__ << " enabling on-disk ERASURE CODES compat feature" << dendl;
     superblock.compat_features.incompat.insert(CEPH_OSD_FEATURE_INCOMPAT_SHARDS);
-    ObjectStore::Transaction t;
-    write_superblock(t);
-    int err = store->apply_transaction(t);
+    ObjectStore::Transaction *t = new ObjectStore::Transaction;
+    write_superblock(*t);
+    int err = store->queue_transaction_and_cleanup(NULL, t);
     assert(err == 0);
     fs->set_allow_sharded_objects();
   }
@@ -6137,9 +6160,15 @@ void OSD::split_pgs(
   parent->update_snap_mapper_bits(
     parent->info.pgid.get_split_bits(pg_num)
     );
+
+  vector<object_stat_sum_t> updated_stats(childpgids.size() + 1);
+  parent->info.stats.stats.sum.split(updated_stats);
+
+  vector<object_stat_sum_t>::iterator stat_iter = updated_stats.begin();
   for (set<spg_t>::const_iterator i = childpgids.begin();
        i != childpgids.end();
-       ++i) {
+       ++i, ++stat_iter) {
+    assert(stat_iter != updated_stats.end());
     dout(10) << "Splitting " << *parent << " into " << *i << dendl;
     assert(service.splitting(*i));
     PG* child = _make_pg(nextmap, *i);
@@ -6160,10 +6189,13 @@ void OSD::split_pgs(
       i->pgid,
       child,
       split_bits);
+    child->info.stats.stats.sum = *stat_iter;
 
     child->write_if_dirty(*(rctx->transaction));
     child->unlock();
   }
+  assert(stat_iter != updated_stats.end());
+  parent->info.stats.stats.sum = *stat_iter;
   parent->write_if_dirty(*(rctx->transaction));
 }
   
@@ -6445,7 +6477,7 @@ void OSD::do_notifies(
       cluster_messenger->send_message(m, con.get());
     } else {
       dout(7) << "do_notify osd " << it->first
-	      << " sending seperate messages" << dendl;
+	      << " sending separate messages" << dendl;
       for (vector<pair<pg_notify_t, pg_interval_map_t> >::iterator i =
 	     it->second.begin();
 	   i != it->second.end();
@@ -6484,7 +6516,7 @@ void OSD::do_queries(map<int, map<spg_t,pg_query_t> >& query_map,
       cluster_messenger->send_message(m, con.get());
     } else {
       dout(7) << "do_queries querying osd." << who
-	      << " sending seperate messages "
+	      << " sending saperate messages "
 	      << " on " << pit->second.size() << " PGs" << dendl;
       for (map<spg_t, pg_query_t>::iterator i = pit->second.begin();
 	   i != pit->second.end();
@@ -6938,6 +6970,11 @@ void OSD::handle_pg_query(OpRequestRef op)
 
     dout(10) << " pg " << pgid << " dne" << dendl;
     pg_info_t empty(spg_t(pgid.pgid, it->second.to));
+    /* This is racy, but that should be ok: if we complete the deletion
+     * before the pg is recreated, we'll just start it off backfilling
+     * instead of just empty */
+    if (service.deleting_pgs.lookup(pgid))
+      empty.last_backfill = hobject_t();
     if (it->second.type == pg_query_t::LOG ||
 	it->second.type == pg_query_t::FULLLOG) {
       ConnectionRef con = service.get_con_osd_cluster(from, osdmap->get_epoch());
@@ -7261,10 +7298,7 @@ void OSDService::handle_misdirected_op(PG *pg, OpRequestRef op)
   MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   assert(m->get_header().type == CEPH_MSG_OSD_OP);
 
-  if (m->get_map_epoch() < pg->info.history.same_primary_since) {
-    dout(7) << *pg << " changed after " << m->get_map_epoch() << ", dropping" << dendl;
-    return;
-  }
+  assert(m->get_map_epoch() >= pg->info.history.same_primary_since);
 
   if (pg->is_ec_pg()) {
     /**
@@ -7530,13 +7564,11 @@ void OSD::OpWQ::_enqueue(pair<PGRef, OpRequestRef> item)
 
 void OSD::OpWQ::_enqueue_front(pair<PGRef, OpRequestRef> item)
 {
-  {
-    Mutex::Locker l(qlock);
-    if (pg_for_processing.count(&*(item.first))) {
-      pg_for_processing[&*(item.first)].push_front(item.second);
-      item.second = pg_for_processing[&*(item.first)].back();
-      pg_for_processing[&*(item.first)].pop_back();
-    }
+  Mutex::Locker l(qlock);
+  if (pg_for_processing.count(&*(item.first))) {
+    pg_for_processing[&*(item.first)].push_front(item.second);
+    item.second = pg_for_processing[&*(item.first)].back();
+    pg_for_processing[&*(item.first)].pop_back();
   }
   unsigned priority = item.second->get_req()->get_priority();
   unsigned cost = item.second->get_req()->get_cost();
@@ -7580,6 +7612,16 @@ void OSD::OpWQ::_process(PGRef pg, ThreadPool::TPHandle &handle)
     if (!(pg_for_processing[&*pg].size()))
       pg_for_processing.erase(&*pg);
   }
+
+  lgeneric_subdout(osd->cct, osd, 30) << "dequeue status: ";
+  Formatter *f = new_formatter("json");
+  f->open_object_section("q");
+  dump(f);
+  f->close_section();
+  f->flush(*_dout);
+  delete f;
+  *_dout << dendl;
+
   osd->dequeue_op(pg, op, handle);
   pg->unlock();
 }

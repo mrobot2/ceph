@@ -4,6 +4,9 @@
  * Ceph - scalable distributed file system
  *
  * Copyright (C) 2011 New Dream Network
+ * Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
+ *
+ * Author: Loic Dachary <loic@dachary.org>
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -43,6 +46,7 @@ const char *ceph_osd_flag_name(unsigned flag)
   case CEPH_OSD_FLAG_SKIPRWLOCKS: return "skiprwlocks";
   case CEPH_OSD_FLAG_IGNORE_OVERLAY: return "ignore_overlay";
   case CEPH_OSD_FLAG_FLUSH: return "flush";
+  case CEPH_OSD_FLAG_MAP_SNAP_CLONE: return "map_snap_clone";
   default: return "???";
   }
 }
@@ -79,7 +83,11 @@ void pg_shard_t::decode(bufferlist::iterator &bl)
 
 ostream &operator<<(ostream &lhs, const pg_shard_t &rhs)
 {
-  return lhs << '(' << rhs.osd << ',' << (unsigned)(rhs.shard) << ')';
+  if (rhs.is_undefined())
+    return lhs << "?";
+  if (rhs.shard == ghobject_t::NO_SHARD)
+    return lhs << rhs.osd;
+  return lhs << rhs.osd << '(' << (unsigned)(rhs.shard) << ')';
 }
 
 // -- osd_reqid_t --
@@ -433,6 +441,7 @@ unsigned pg_t::get_split_bits(unsigned pg_num) const {
 
   // Find unique p such that pg_num \in [2^(p-1), 2^p)
   unsigned p = pg_pool_t::calc_bits_of(pg_num);
+  assert(p); // silence coverity #751330 
 
   if ((m_seed % (1<<(p-1))) < (pg_num % (1<<(p-1))))
     return p;
@@ -781,14 +790,7 @@ void pg_pool_t::dump(Formatter *f) const
 		   cache_target_full_ratio_micro);
   f->dump_unsigned("cache_min_flush_age", cache_min_flush_age);
   f->dump_unsigned("cache_min_evict_age", cache_min_evict_age);
-  f->open_object_section("properties");
-  for (map<string,string>::const_iterator i = properties.begin();
-       i != properties.end();
-       ++i) {
-    string name = i->first;
-    f->dump_string(name.c_str(), i->second);
-  }
-  f->close_section();
+  f->dump_string("erasure_code_profile", erasure_code_profile);
   f->open_object_section("hit_set_params");
   hit_set_params.dump(f);
   f->close_section(); // hit_set_params
@@ -1046,7 +1048,7 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   }
 
   __u8 encode_compat = 5;
-  ENCODE_START(13, encode_compat, bl);
+  ENCODE_START(14, encode_compat, bl);
   ::encode(type, bl);
   ::encode(size, bl);
   ::encode(crush_ruleset, bl);
@@ -1074,8 +1076,6 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(read_tier, bl);
   ::encode(write_tier, bl);
   ::encode(properties, bl);
-  if (hit_set_params.get_type() != HitSet::TYPE_NONE)
-    encode_compat = MAX(encode_compat, 11); // need to be able to understand all the data!
   ::encode(hit_set_params, bl);
   ::encode(hit_set_period, bl);
   ::encode(hit_set_count, bl);
@@ -1086,12 +1086,13 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(cache_target_full_ratio_micro, bl);
   ::encode(cache_min_flush_age, bl);
   ::encode(cache_min_evict_age, bl);
-  ENCODE_FINISH_NEW_COMPAT(bl, encode_compat);
+  ::encode(erasure_code_profile, bl);
+  ENCODE_FINISH(bl);
 }
 
 void pg_pool_t::decode(bufferlist::iterator& bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(13, 5, 5, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(14, 5, 5, bl);
   ::decode(type, bl);
   ::decode(size, bl);
   ::decode(crush_ruleset, bl);
@@ -1178,13 +1179,15 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
     ::decode(cache_min_flush_age, bl);
     ::decode(cache_min_evict_age, bl);
   } else {
-    pg_pool_t def;
-    target_max_bytes = def.target_max_bytes;
-    target_max_objects = def.target_max_objects;
-    cache_target_dirty_ratio_micro = def.cache_target_dirty_ratio_micro;
-    cache_target_full_ratio_micro = def.cache_target_full_ratio_micro;
-    cache_min_flush_age = def.cache_min_flush_age;
-    cache_min_evict_age = def.cache_min_evict_age;
+    target_max_bytes = 0;
+    target_max_objects = 0;
+    cache_target_dirty_ratio_micro = 0;
+    cache_target_full_ratio_micro = 0;
+    cache_min_flush_age = 0;
+    cache_min_evict_age = 0;
+  }
+  if (struct_v >= 14) {
+    ::decode(erasure_code_profile, bl);
   }
 
   DECODE_FINISH(bl);
@@ -1228,8 +1231,6 @@ void pg_pool_t::generate_test_instances(list<pg_pool_t*>& o)
   a.cache_mode = CACHEMODE_WRITEBACK;
   a.read_tier = 1;
   a.write_tier = 1;
-  a.properties["p-1"] = "v-1";
-  a.properties["empty"] = string();
   a.hit_set_params = HitSet::Params(new BloomHitSet::Params);
   a.hit_set_period = 3600;
   a.hit_set_count = 8;
@@ -1240,6 +1241,7 @@ void pg_pool_t::generate_test_instances(list<pg_pool_t*>& o)
   a.cache_target_full_ratio_micro = 987222;
   a.cache_min_flush_age = 231;
   a.cache_min_evict_age = 2321;
+  a.erasure_code_profile = "profile in osdmap";
   o.push_back(new pg_pool_t(a));
 }
 
@@ -1309,11 +1311,13 @@ void object_stat_sum_t::dump(Formatter *f) const
   f->dump_int("num_objects_recovered", num_objects_recovered);
   f->dump_int("num_bytes_recovered", num_bytes_recovered);
   f->dump_int("num_keys_recovered", num_keys_recovered);
+  f->dump_int("num_objects_omap", num_objects_omap);
+  f->dump_int("num_objects_hit_set_archive", num_objects_hit_set_archive);
 }
 
 void object_stat_sum_t::encode(bufferlist& bl) const
 {
-  ENCODE_START(7, 3, bl);
+  ENCODE_START(9, 3, bl);
   ::encode(num_bytes, bl);
   ::encode(num_objects, bl);
   ::encode(num_object_clones, bl);
@@ -1333,12 +1337,14 @@ void object_stat_sum_t::encode(bufferlist& bl) const
   ::encode(num_deep_scrub_errors, bl);
   ::encode(num_objects_dirty, bl);
   ::encode(num_whiteouts, bl);
+  ::encode(num_objects_omap, bl);
+  ::encode(num_objects_hit_set_archive, bl);
   ENCODE_FINISH(bl);
 }
 
 void object_stat_sum_t::decode(bufferlist::iterator& bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(7, 3, 3, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(9, 3, 3, bl);
   ::decode(num_bytes, bl);
   if (struct_v < 3) {
     uint64_t num_kb;
@@ -1381,6 +1387,16 @@ void object_stat_sum_t::decode(bufferlist::iterator& bl)
   } else {
     num_objects_dirty = 0;
     num_whiteouts = 0;
+  }
+  if (struct_v >= 8) {
+    ::decode(num_objects_omap, bl);
+  } else {
+    num_objects_omap = 0;
+  }
+  if (struct_v >= 9) {
+    ::decode(num_objects_hit_set_archive, bl);
+  } else {
+    num_objects_hit_set_archive = 0;
   }
   DECODE_FINISH(bl);
 }
@@ -1431,6 +1447,8 @@ void object_stat_sum_t::add(const object_stat_sum_t& o)
   num_keys_recovered += o.num_keys_recovered;
   num_objects_dirty += o.num_objects_dirty;
   num_whiteouts += o.num_whiteouts;
+  num_objects_omap += o.num_objects_omap;
+  num_objects_hit_set_archive += o.num_objects_hit_set_archive;
 }
 
 void object_stat_sum_t::sub(const object_stat_sum_t& o)
@@ -1454,6 +1472,8 @@ void object_stat_sum_t::sub(const object_stat_sum_t& o)
   num_keys_recovered -= o.num_keys_recovered;
   num_objects_dirty -= o.num_objects_dirty;
   num_whiteouts -= o.num_whiteouts;
+  num_objects_omap -= o.num_objects_omap;
+  num_objects_hit_set_archive -= o.num_objects_hit_set_archive;
 }
 
 
@@ -1563,7 +1583,7 @@ void pg_stat_t::dump_brief(Formatter *f) const
 
 void pg_stat_t::encode(bufferlist &bl) const
 {
-  ENCODE_START(15, 8, bl);
+  ENCODE_START(17, 8, bl);
   ::encode(version, bl);
   ::encode(reported_seq, bl);
   ::encode(reported_epoch, bl);
@@ -1595,12 +1615,14 @@ void pg_stat_t::encode(bufferlist &bl) const
   ::encode(dirty_stats_invalid, bl);
   ::encode(up_primary, bl);
   ::encode(acting_primary, bl);
+  ::encode(omap_stats_invalid, bl);
+  ::encode(hitset_stats_invalid, bl);
   ENCODE_FINISH(bl);
 }
 
 void pg_stat_t::decode(bufferlist::iterator &bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(15, 8, 8, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(17, 8, 8, bl);
   ::decode(version, bl);
   ::decode(reported_seq, bl);
   ::decode(reported_epoch, bl);
@@ -1693,6 +1715,20 @@ void pg_stat_t::decode(bufferlist::iterator &bl)
   } else {
     up_primary = up.size() ? up[0] : -1;
     acting_primary = acting.size() ? acting[0] : -1;
+  }
+  if (struct_v >= 16) {
+    ::decode(omap_stats_invalid, bl);
+  } else {
+    // if we are decoding an old encoding of this object, then the
+    // encoder may not have supported num_objects_omap accounting.
+    omap_stats_invalid = true;
+  }
+  if (struct_v >= 17) {
+    ::decode(hitset_stats_invalid, bl);
+  } else {
+    // if we are decoding an old encoding of this object, then the
+    // encoder may not have supported num_objects_hit_set_archive accounting.
+    hitset_stats_invalid = true;
   }
   DECODE_FINISH(bl);
 }
@@ -3451,6 +3487,21 @@ void SnapSet::from_snap_set(const librados::snap_set_t& ss)
     snaps.push_back(*p);
 }
 
+uint64_t SnapSet::get_clone_bytes(snapid_t clone) const
+{
+  assert(clone_size.count(clone));
+  uint64_t size = clone_size.find(clone)->second;
+  assert(clone_overlap.count(clone));
+  const interval_set<uint64_t> &overlap = clone_overlap.find(clone)->second;
+  for (interval_set<uint64_t>::const_iterator i = overlap.begin();
+       i != overlap.end();
+       ++i) {
+    assert(size >= i.get_len());
+    size -= i.get_len();
+  }
+  return size;
+}
+
 // -- watch_info_t --
 
 void watch_info_t::encode(bufferlist& bl) const
@@ -4280,6 +4331,7 @@ ostream& operator<<(ostream& out, const OSDOp& op)
     case CEPH_OSD_OP_COPY_GET:
     case CEPH_OSD_OP_COPY_GET_CLASSIC:
       out << " max " << op.op.copy_get.max;
+      break;
     case CEPH_OSD_OP_COPY_FROM:
       out << " ver " << op.op.copy_from.src_version;
       break;

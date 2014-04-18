@@ -21,27 +21,29 @@
 
 struct ECSubWrite {
   pg_shard_t from;
-  tid_t tid;
+  ceph_tid_t tid;
   osd_reqid_t reqid;
   hobject_t soid;
   pg_stat_t stats;
   ObjectStore::Transaction t;
- eversion_t at_version;
+  eversion_t at_version;
   eversion_t trim_to;
   vector<pg_log_entry_t> log_entries;
   set<hobject_t> temp_added;
   set<hobject_t> temp_removed;
+  boost::optional<pg_hit_set_history_t> updated_hit_set_history;
   ECSubWrite() {}
   ECSubWrite(
     pg_shard_t from,
-    tid_t tid,
+    ceph_tid_t tid,
     osd_reqid_t reqid,
     hobject_t soid,
-    pg_stat_t stats,
-    ObjectStore::Transaction t,
+    const pg_stat_t &stats,
+    const ObjectStore::Transaction &t,
     eversion_t at_version,
     eversion_t trim_to,
     vector<pg_log_entry_t> log_entries,
+    boost::optional<pg_hit_set_history_t> updated_hit_set_history,
     const set<hobject_t> &temp_added,
     const set<hobject_t> &temp_removed)
     : from(from), tid(tid), reqid(reqid),
@@ -49,7 +51,8 @@ struct ECSubWrite {
       at_version(at_version),
       trim_to(trim_to), log_entries(log_entries),
       temp_added(temp_added),
-      temp_removed(temp_removed) {}
+      temp_removed(temp_removed),
+      updated_hit_set_history(updated_hit_set_history) {}
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator &bl);
   void dump(Formatter *f) const;
@@ -59,7 +62,7 @@ WRITE_CLASS_ENCODER(ECSubWrite)
 
 struct ECSubWriteReply {
   pg_shard_t from;
-  tid_t tid;
+  ceph_tid_t tid;
   eversion_t last_complete;
   bool committed;
   bool applied;
@@ -73,7 +76,7 @@ WRITE_CLASS_ENCODER(ECSubWriteReply)
 
 struct ECSubRead {
   pg_shard_t from;
-  tid_t tid;
+  ceph_tid_t tid;
   map<hobject_t, list<pair<uint64_t, uint64_t> > > to_read;
   set<hobject_t> attrs_to_read;
   void encode(bufferlist &bl) const;
@@ -85,7 +88,7 @@ WRITE_CLASS_ENCODER(ECSubRead)
 
 struct ECSubReadReply {
   pg_shard_t from;
-  tid_t tid;
+  ceph_tid_t tid;
   map<hobject_t, list<pair<uint64_t, bufferlist> > > buffers_read;
   map<hobject_t, map<string, bufferlist> > attrs_read;
   map<hobject_t, int> errors;

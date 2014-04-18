@@ -4,6 +4,9 @@
  * Ceph - scalable distributed file system
  *
  * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
+ * Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
+ *
+ * Author: Loic Dachary <loic@dachary.org>
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -875,7 +878,8 @@ private:
 
 
 public:
-  map<string,string> properties;  ///< interpreted according to the pool type
+  map<string,string> properties;  ///< OBSOLETE
+  string erasure_code_profile; ///< name of the erasure code profile in OSDMap
   epoch_t last_change;      ///< most recent epoch changed, exclusing snapshot changes
   snapid_t snap_seq;        ///< seq for per-pool snapshot
   epoch_t snap_epoch;       ///< osdmap epoch of last snap
@@ -943,8 +947,8 @@ public:
       tier_of(-1), read_tier(-1), write_tier(-1),
       cache_mode(CACHEMODE_NONE),
       target_max_bytes(0), target_max_objects(0),
-      cache_target_dirty_ratio_micro(400000),
-      cache_target_full_ratio_micro(800000),
+      cache_target_dirty_ratio_micro(0),
+      cache_target_full_ratio_micro(0),
       cache_min_flush_age(0),
       cache_min_evict_age(0),
       hit_set_params(),
@@ -1120,6 +1124,8 @@ struct object_stat_sum_t {
   int64_t num_keys_recovered;
   int64_t num_objects_dirty;
   int64_t num_whiteouts;
+  int64_t num_objects_omap;
+  int64_t num_objects_hit_set_archive;
 
   object_stat_sum_t()
     : num_bytes(0),
@@ -1132,7 +1138,9 @@ struct object_stat_sum_t {
       num_bytes_recovered(0),
       num_keys_recovered(0),
       num_objects_dirty(0),
-      num_whiteouts(0)
+      num_whiteouts(0),
+      num_objects_omap(0),
+      num_objects_hit_set_archive(0)
   {}
 
   void floor(int64_t f) {
@@ -1156,7 +1164,42 @@ struct object_stat_sum_t {
     FLOOR(num_keys_recovered);
     FLOOR(num_objects_dirty);
     FLOOR(num_whiteouts);
+    FLOOR(num_objects_omap);
+    FLOOR(num_objects_hit_set_archive);
 #undef FLOOR
+  }
+
+  void split(vector<object_stat_sum_t> &out) const {
+#define SPLIT(PARAM)                            \
+    for (unsigned i = 0; i < out.size(); ++i) { \
+      out[i].PARAM = PARAM / out.size();        \
+      if (i < (PARAM % out.size())) {           \
+	out[i].PARAM++;                         \
+      }                                         \
+    }                                           \
+
+    SPLIT(num_bytes);
+    SPLIT(num_objects);
+    SPLIT(num_object_clones);
+    SPLIT(num_object_copies);
+    SPLIT(num_objects_missing_on_primary);
+    SPLIT(num_objects_degraded);
+    SPLIT(num_objects_unfound);
+    SPLIT(num_rd);
+    SPLIT(num_rd_kb);
+    SPLIT(num_wr);
+    SPLIT(num_wr_kb);
+    SPLIT(num_scrub_errors);
+    SPLIT(num_shallow_scrub_errors);
+    SPLIT(num_deep_scrub_errors);
+    SPLIT(num_objects_recovered);
+    SPLIT(num_bytes_recovered);
+    SPLIT(num_keys_recovered);
+    SPLIT(num_objects_dirty);
+    SPLIT(num_whiteouts);
+    SPLIT(num_objects_omap);
+    SPLIT(num_objects_hit_set_archive);
+#undef SPLIT
   }
 
   void clear() {
@@ -1286,6 +1329,8 @@ struct pg_stat_t {
   /// true if num_objects_dirty is not accurate (because it was not
   /// maintained starting from pool creation)
   bool dirty_stats_invalid;
+  bool omap_stats_invalid;
+  bool hitset_stats_invalid;
 
   /// up, acting primaries
   int up_primary;
@@ -1301,6 +1346,7 @@ struct pg_stat_t {
       log_size(0), ondisk_log_size(0),
       mapping_epoch(0),
       dirty_stats_invalid(false),
+      omap_stats_invalid(false),
       up_primary(-1),
       acting_primary(-1)
   { }
@@ -1592,9 +1638,9 @@ inline ostream& operator<<(ostream& out, const pg_info_t& pgi)
     if (pgi.last_complete != pgi.last_update)
       out << " lc " << pgi.last_complete;
     out << " (" << pgi.log_tail << "," << pgi.last_update << "]";
-    if (pgi.is_incomplete())
-      out << " lb " << pgi.last_backfill;
   }
+  if (pgi.is_incomplete())
+    out << " lb " << pgi.last_backfill;
   //out << " c " << pgi.epoch_created;
   out << " local-les=" << pgi.last_epoch_started;
   out << " n=" << pgi.stats.stats.sum.num_objects;
@@ -2424,6 +2470,9 @@ struct SnapSet {
 
   /// populate SnapSet from a librados::snap_set_t
   void from_snap_set(const librados::snap_set_t& ss);
+
+  /// get space accounted to clone
+  uint64_t get_clone_bytes(snapid_t clone) const;
     
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
@@ -2445,7 +2494,7 @@ struct watch_info_t {
   entity_addr_t addr;
 
   watch_info_t() : cookie(0), timeout_seconds(0) { }
-  watch_info_t(uint64_t c, uint32_t t, entity_addr_t a) : cookie(c), timeout_seconds(t), addr(a) {}
+  watch_info_t(uint64_t c, uint32_t t, const entity_addr_t& a) : cookie(c), timeout_seconds(t), addr(a) {}
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
@@ -2549,6 +2598,9 @@ struct object_info_t {
   bool is_dirty() const {
     return test_flag(FLAG_DIRTY);
   }
+  bool is_omap() const {
+    return test_flag(FLAG_OMAP);
+  }
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
@@ -2591,8 +2643,10 @@ struct SnapSetContext {
   int ref;
   bool registered;
   SnapSet snapset;
+  bool exists;
 
-  SnapSetContext(const hobject_t& o) : oid(o), ref(0), registered(false) { }
+  SnapSetContext(const hobject_t& o) :
+    oid(o), ref(0), registered(false), exists(true) { }
 };
 
 
@@ -2626,6 +2680,7 @@ public:
   // set if writes for this object are blocked on another objects recovery
   ObjectContextRef blocked_by;      // object blocking our writes
   set<ObjectContextRef> blocking;   // objects whose writes we block
+  bool requeue_scrub_on_unblock;    // true if we need to requeue scrub on unblock
 
   // any entity in obs.oi.watchers MUST be in either watchers or unconnected_watchers.
   map<pair<uint64_t, entity_name_t>, WatchRef> watchers;
@@ -2654,6 +2709,9 @@ public:
 
     /// if set, restart backfill when we can get a read lock
     bool backfill_read_marker;
+
+    /// if set, requeue snaptrim on lock release
+    bool snaptrimmer_write_marker;
 
     RWState() : state(RWNONE), count(0), backfill_read_marker(false) {}
     bool get_read(OpRequestRef op) {
@@ -2748,6 +2806,10 @@ public:
   bool get_write(OpRequestRef op) {
     return rwstate.get_write(op);
   }
+  bool get_snaptrimmer_write() {
+    rwstate.snaptrimmer_write_marker = true;
+    return rwstate.get_write_lock();
+  }
   bool get_backfill_read() {
     rwstate.backfill_read_marker = true;
     if (rwstate.get_read_lock()) {
@@ -2764,11 +2826,16 @@ public:
     rwstate.put_read(to_wake);
   }
   void put_write(list<OpRequestRef> *to_wake,
-		 bool *requeue_recovery) {
+		 bool *requeue_recovery,
+		 bool *requeue_snaptrimmer) {
     rwstate.put_write(to_wake);
     if (rwstate.empty() && rwstate.backfill_read_marker) {
       rwstate.backfill_read_marker = false;
       *requeue_recovery = true;
+    }
+    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
+      rwstate.snaptrimmer_write_marker = false;
+      *requeue_snaptrimmer = true;
     }
   }
 
@@ -2777,7 +2844,7 @@ public:
       destructor_callback(0),
       lock("ReplicatedPG::ObjectContext::lock"),
       unstable_writes(0), readers(0), writers_waiting(0), readers_waiting(0),
-      blocked(false) {}
+      blocked(false), requeue_scrub_on_unblock(false) {}
 
   ~ObjectContext() {
     assert(rwstate.empty());
@@ -3085,7 +3152,7 @@ struct watch_item_t {
 
   watch_item_t() : cookie(0), timeout_seconds(0) { }
   watch_item_t(entity_name_t name, uint64_t cookie, uint32_t timeout,
-     entity_addr_t addr)
+     const entity_addr_t& addr)
     : name(name), cookie(cookie), timeout_seconds(timeout),
     addr(addr) { }
 

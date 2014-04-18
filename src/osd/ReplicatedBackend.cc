@@ -194,7 +194,7 @@ void ReplicatedBackend::clear_state()
 
 void ReplicatedBackend::_on_change(ObjectStore::Transaction *t)
 {
-  for (map<tid_t, InProgressOp>::iterator i = in_progress_ops.begin();
+  for (map<ceph_tid_t, InProgressOp>::iterator i = in_progress_ops.begin();
        i != in_progress_ops.end();
        in_progress_ops.erase(i++)) {
     if (i->second.on_commit)
@@ -494,10 +494,11 @@ void ReplicatedBackend::submit_transaction(
   PGTransaction *_t,
   const eversion_t &trim_to,
   vector<pg_log_entry_t> &log_entries,
+  boost::optional<pg_hit_set_history_t> &hset_history,
   Context *on_local_applied_sync,
   Context *on_all_acked,
   Context *on_all_commit,
-  tid_t tid,
+  ceph_tid_t tid,
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
@@ -536,6 +537,7 @@ void ReplicatedBackend::submit_transaction(
     t->get_temp_cleared().size() ?
       *(t->get_temp_cleared().begin()) :hobject_t(),
     log_entries,
+    hset_history,
     &op,
     op_t);
 
@@ -546,7 +548,7 @@ void ReplicatedBackend::submit_transaction(
   }
   clear_temp_objs(t->get_temp_cleared());
 
-  parent->log_operation(log_entries, trim_to, true, &local_t);
+  parent->log_operation(log_entries, hset_history, trim_to, true, &local_t);
   local_t.append(*op_t);
   local_t.swap(*op_t);
   
@@ -611,11 +613,11 @@ void ReplicatedBackend::sub_op_modify_reply(OpRequestRef op)
   op->mark_started();
 
   // must be replication.
-  tid_t rep_tid = r->get_tid();
+  ceph_tid_t rep_tid = r->get_tid();
   pg_shard_t from = r->from;
 
   if (in_progress_ops.count(rep_tid)) {
-    map<tid_t, InProgressOp>::iterator iter =
+    map<ceph_tid_t, InProgressOp>::iterator iter =
       in_progress_ops.find(rep_tid);
     InProgressOp &ip_op = iter->second;
     MOSDOp *m = NULL;

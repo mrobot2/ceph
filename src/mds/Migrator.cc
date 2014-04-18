@@ -325,15 +325,15 @@ void Migrator::export_try_cancel(CDir *dir, bool notify_peer)
     mds->queue_waiters(it->second.waiting_for_finish);
     // drop locks
     if (state == EXPORT_LOCKING || state == EXPORT_DISCOVERING) {
-      MDRequest *mdr = dynamic_cast<MDRequest*>(it->second.mut);
+      MDRequestRef mdr = ceph::static_pointer_cast<MDRequestImpl,
+						   MutationImpl>(it->second.mut);
       assert(mdr);
       if (mdr->more()->waiting_on_slave.empty())
 	mds->mdcache->request_finish(mdr);
     } else if (it->second.mut) {
-      Mutation *mut = it->second.mut;
-      mds->locker->drop_locks(mut);
+      MutationRef& mut = it->second.mut;
+      mds->locker->drop_locks(mut.get());
       mut->cleanup();
-      delete mut;
     }
 
     export_state.erase(it);
@@ -745,7 +745,7 @@ void Migrator::export_dir(CDir *dir, int dest)
   dir->auth_pin(this);
   dir->state_set(CDir::STATE_EXPORTING);
 
-  MDRequest *mdr = mds->mdcache->request_start_internal(CEPH_MDS_OP_EXPORTDIR);
+  MDRequestRef mdr = mds->mdcache->request_start_internal(CEPH_MDS_OP_EXPORTDIR);
   mdr->more()->export_dir = dir;
 
   assert(export_state.count(dir) == 0);
@@ -758,7 +758,7 @@ void Migrator::export_dir(CDir *dir, int dest)
   dispatch_export_dir(mdr);
 }
 
-void Migrator::dispatch_export_dir(MDRequest *mdr)
+void Migrator::dispatch_export_dir(MDRequestRef& mdr)
 {
   dout(7) << "dispatch_export_dir " << *mdr << dendl;
   CDir *dir = mdr->more()->export_dir;
@@ -845,10 +845,11 @@ void Migrator::handle_export_discover_ack(MExportDirDiscoverAck *m)
   } else {
     assert(it->second.state == EXPORT_DISCOVERING);
     // release locks to avoid deadlock
-    MDRequest *mdr = dynamic_cast<MDRequest*>(it->second.mut);
+    MDRequestRef mdr = ceph::static_pointer_cast<MDRequestImpl,
+						 MutationImpl>(it->second.mut);
     assert(mdr);
     mds->mdcache->request_finish(mdr);
-    it->second.mut = NULL;
+    it->second.mut.reset();
     // freeze the subtree
     it->second.state = EXPORT_FREEZING;
     dir->auth_unpin(this);
@@ -921,7 +922,7 @@ void Migrator::export_frozen(CDir *dir)
     return;
   }
 
-  it->second.mut = new Mutation;
+  it->second.mut = MutationRef(new MutationImpl);
   if (diri->is_auth())
     it->second.mut->auth_pin(diri);
   mds->locker->rdlock_take_set(rdlocks, it->second.mut);
@@ -1345,6 +1346,8 @@ void Migrator::finish_export_inode(CInode *in, utime_t now, int peer,
   in->item_open_file.remove_myself();
 
   in->clear_dirty_parent();
+
+  in->clear_file_locks();
 
   // waiters
   in->take_waiting(CInode::WAIT_ANY_MASK, finished);
@@ -1798,11 +1801,10 @@ void Migrator::export_finish(CDir *dir)
   mds->queue_waiters(it->second.waiting_for_finish);
 
   // unpin path
-  Mutation *mut = it->second.mut;
+  MutationRef& mut = it->second.mut;
   if (mut) {
-    mds->locker->drop_locks(mut);
+    mds->locker->drop_locks(mut.get());
     mut->cleanup();
-    delete mut;
   }
 
   export_state.erase(it);
@@ -1869,7 +1871,8 @@ void Migrator::handle_export_discover(MExportDirDiscover *m)
     // must discover it!
     filepath fpath(m->get_path());
     vector<CDentry*> trace;
-    int r = cache->path_traverse(NULL, m, NULL, fpath, &trace, NULL, MDS_TRAVERSE_DISCOVER);
+    MDRequestRef null_ref;
+    int r = cache->path_traverse(null_ref, m, NULL, fpath, &trace, NULL, MDS_TRAVERSE_DISCOVER);
     if (r > 0) return;
     if (r < 0) {
       dout(7) << "handle_export_discover_2 failed to discover or not dir " << m->get_path() << ", NAK" << dendl;
@@ -2115,7 +2118,7 @@ void Migrator::handle_export_prep(MExportDirPrep *m)
   bool success = true;
   if (dir->get_inode()->filelock.can_wrlock(-1) &&
       dir->get_inode()->nestlock.can_wrlock(-1)) {
-    it->second.mut = new Mutation;
+    it->second.mut = MutationRef(new MutationImpl);
     // force some locks.  hacky.
     mds->locker->wrlock_force(&dir->inode->filelock, it->second.mut);
     mds->locker->wrlock_force(&dir->inode->nestlock, it->second.mut);
@@ -2361,6 +2364,8 @@ void Migrator::import_reverse(CDir *dir)
 	in->dirfragtreelock.clear_gather();
 	in->filelock.clear_gather();
 
+	in->clear_file_locks();
+
 	// non-bounding dir?
 	list<CDir*> dfs;
 	in->get_dirfrags(dfs);
@@ -2385,6 +2390,7 @@ void Migrator::import_reverse(CDir *dir)
 	if (cap->is_new())
 	  in->remove_client_cap(q->first);
       }
+      in->put(CInode::PIN_IMPORTINGCAPS);
     }
     for (map<client_t,entity_inst_t>::iterator p = stat.client_map.begin();
 	 p != stat.client_map.end();
@@ -2467,9 +2473,8 @@ void Migrator::import_reverse_final(CDir *dir)
   // clean up
   map<dirfrag_t, import_state_t>::iterator it = import_state.find(dir->dirfrag());
   if (it->second.mut) {
-    mds->locker->drop_locks(it->second.mut);
+    mds->locker->drop_locks(it->second.mut.get());
     it->second.mut->cleanup();
-    delete it->second.mut;
   }
   import_state.erase(it);
 
@@ -2569,12 +2574,12 @@ void Migrator::import_finish(CDir *dir, bool notify, bool last)
 	assert(session);
 	Capability *cap = in->get_client_cap(q->first);
 	assert(cap);
-	cap->clear_new();
 	cap->merge(q->second, true);
 	mds->mdcache->do_cap_import(session, in, cap, q->second.cap_id, q->second.seq,
 				    q->second.mseq - 1, it->second.peer, CEPH_CAP_FLAG_AUTH);
       }
       p->second.clear();
+      in->replica_caps_wanted = 0;
     }
     for (map<client_t,entity_inst_t>::iterator p = it->second.client_map.begin();
 	 p != it->second.client_map.end();
@@ -2612,7 +2617,7 @@ void Migrator::import_finish(CDir *dir, bool notify, bool last)
   it->second.peer_exports.swap(peer_exports);
 
   // clear import state (we're done!)
-  Mutation *mut = it->second.mut;
+  MutationRef mut = it->second.mut;
   import_state.erase(it);
 
   mds->mdlog->start_submit_entry(new EImportFinish(dir, true));
@@ -2630,17 +2635,18 @@ void Migrator::import_finish(CDir *dir, bool notify, bool last)
   //audit();  // this fails, bc we munge up the subtree map during handle_import_map (resolve phase)
 
   if (mut) {
-    mds->locker->drop_locks(mut);
+    mds->locker->drop_locks(mut.get());
     mut->cleanup();
-    delete mut;
   }
 
   // re-eval imported caps
   for (map<CInode*, map<client_t,Capability::Export> >::iterator p = peer_exports.begin();
        p != peer_exports.end();
-       ++p)
+       ++p) {
     if (p->first->is_auth())
       mds->locker->eval(p->first, CEPH_CAP_LOCKS, true);
+    p->first->put(CInode::PIN_IMPORTINGCAPS);
+  }
 
   // send pending import_maps?
   mds->mdcache->maybe_send_pending_resolves();
@@ -2771,8 +2777,10 @@ void Migrator::finish_import_inode_caps(CInode *in, int peer, bool auth_cap,
     }
   }
 
-  in->replica_caps_wanted = 0;
-  in->put(CInode::PIN_IMPORTINGCAPS);
+  if (peer >= 0) {
+    in->replica_caps_wanted = 0;
+    in->put(CInode::PIN_IMPORTINGCAPS);
+  }
 }
 
 int Migrator::decode_import_dir(bufferlist::iterator& blp,
@@ -2803,7 +2811,7 @@ int Migrator::decode_import_dir(bufferlist::iterator& blp,
 
   // adjust replica list
   //assert(!dir->is_replica(oldauth));    // not true on failed export
-  dir->add_replica(oldauth);
+  dir->add_replica(oldauth, CDir::EXPORT_NONCE);
   if (dir->is_replica(mds->get_nodeid()))
     dir->remove_replica(mds->get_nodeid());
 
@@ -2984,10 +2992,10 @@ void Migrator::handle_export_caps(MExportCaps *ex)
   
   assert(in);
   assert(in->is_auth());
-  /*
-   * note: i may be frozen, but i won't have been encoded for export (yet)!
-   *  see export_go() vs export_go_synced().
-   */
+
+  // FIXME
+  if (in->is_frozen())
+    return;
 
   C_M_LoggedImportCaps *finish = new C_M_LoggedImportCaps(this, in, ex->get_source().num());
   finish->client_map = ex->client_map;
@@ -3017,6 +3025,8 @@ void Migrator::logged_import_caps(CInode *in,
 				  map<client_t,uint64_t>& sseqmap) 
 {
   dout(10) << "logged_import_caps on " << *in << dendl;
+  // see export_go() vs export_go_synced()
+  assert(in->is_auth());
 
   // force open client sessions and finish cap import
   mds->server->finish_force_open_sessions(client_map, sseqmap);

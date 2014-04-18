@@ -151,7 +151,7 @@ public:
 
   static const int WAIT_DNLOCK_OFFSET = 4;
 
-  static const uint64_t WAIT_ANY_MASK  = (0xffffffff);
+  static const uint64_t WAIT_ANY_MASK = (uint64_t)(-1);
   static const uint64_t WAIT_ATFREEZEROOT = (WAIT_UNFREEZE);
   static const uint64_t WAIT_ATSUBTREEROOT = (WAIT_SINGLEAUTH);
 
@@ -179,7 +179,7 @@ public:
   void resync_accounted_fragstat();
   void resync_accounted_rstat();
   void assimilate_dirty_rstat_inodes();
-  void assimilate_dirty_rstat_inodes_finish(Mutation *mut, EMetaBlob *blob);
+  void assimilate_dirty_rstat_inodes_finish(MutationRef& mut, EMetaBlob *blob);
 
 protected:
   version_t projected_version;
@@ -219,6 +219,7 @@ public:
   void log_mark_dirty();
   void mark_clean();
 
+  bool is_new() { return item_new.is_on_list(); }
   void mark_new(LogSegment *ls);
 
 public:
@@ -324,6 +325,7 @@ protected:
     return num_dirty;
   }
 
+  int64_t get_frag_size() { return get_projected_fnode()->fragstat.size(); }
 
   // -- dentries and inodes --
  public:
@@ -370,10 +372,10 @@ public:
   void merge(list<CDir*>& subs, list<Context*>& waiters, bool replay);
 
   bool should_split() {
-    return (int)get_num_head_items() > g_conf->mds_bal_split_size;
+    return (int)get_frag_size() > g_conf->mds_bal_split_size;
   }
   bool should_merge() {
-    return (int)get_num_head_items() < g_conf->mds_bal_merge_size;
+    return (int)get_frag_size() < g_conf->mds_bal_merge_size;
   }
 
 private:
@@ -496,14 +498,15 @@ protected:
 
   // -- commit --
   map<version_t, list<Context*> > waiting_for_commit;
-  void _commit(version_t want);
-  void _omap_commit();
+  void _commit(version_t want, int op_prio);
+  void _omap_commit(int op_prio);
   void _encode_dentry(CDentry *dn, bufferlist& bl, const set<snapid_t> *snaps);
   void _committed(version_t v);
 public:
   void wait_for_commit(Context *c, version_t v=0);
   void commit_to(version_t want);
-  void commit(version_t want, Context *c, bool ignore_authpinnability=false);
+  void commit(version_t want, Context *c,
+	      bool ignore_authpinnability=false, int op_prio=-1);
 
   // -- dirtyness --
   version_t get_committing_version() { return committing_version; }

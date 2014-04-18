@@ -453,6 +453,13 @@ void librados::ObjectWriteOperation::selfmanaged_snap_rollback(snap_t snapid)
   o->rollback(snapid);
 }
 
+// You must specify the snapid not the name normally used with pool snapshots
+void librados::ObjectWriteOperation::snap_rollback(snap_t snapid)
+{
+  ::ObjectOperation *o = (::ObjectOperation *)impl;
+  o->rollback(snapid);
+}
+
 void librados::ObjectWriteOperation::set_alloc_hint(
                                             uint64_t expected_object_size,
                                             uint64_t expected_write_size)
@@ -1144,9 +1151,15 @@ int librados::IoCtx::snap_list(std::vector<snap_t> *snaps)
   return io_ctx_impl->snap_list(snaps);
 }
 
-int librados::IoCtx::rollback(const std::string& oid, const char *snapname)
+int librados::IoCtx::snap_rollback(const std::string& oid, const char *snapname)
 {
   return io_ctx_impl->rollback(oid, snapname);
+}
+
+// Deprecated name kept for backward compatibility
+int librados::IoCtx::rollback(const std::string& oid, const char *snapname)
+{
+  return snap_rollback(oid, snapname);
 }
 
 int librados::IoCtx::selfmanaged_snap_create(uint64_t *snapid)
@@ -2021,6 +2034,12 @@ extern "C" int rados_cluster_fsid(rados_t cluster, char *buf,
   return fsid.length();
 }
 
+extern "C" int rados_wait_for_latest_osdmap(rados_t cluster)
+{
+  librados::RadosClient *radosp = (librados::RadosClient *)cluster;
+  return radosp->wait_for_latest_osdmap();
+}
+
 extern "C" int rados_pool_list(rados_t cluster, char *buf, size_t len)
 {
   librados::RadosClient *client = (librados::RadosClient *)cluster;
@@ -2029,7 +2048,7 @@ extern "C" int rados_pool_list(rados_t cluster, char *buf, size_t len)
   if (r < 0)
     return r;
 
-  if (!buf)
+  if (len > 0 && !buf)
     return -EINVAL;
 
   char *b = buf;
@@ -2421,6 +2440,18 @@ extern "C" int rados_ioctx_pool_get_auid(rados_ioctx_t io, uint64_t *auid)
   return ctx->client->pool_get_auid(ctx->get_id(), (unsigned long long *)auid);
 }
 
+extern "C" int rados_ioctx_pool_requires_alignment(rados_ioctx_t io)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->client->pool_requires_alignment(ctx->get_id());
+}
+
+extern "C" uint64_t rados_ioctx_pool_required_alignment(rados_ioctx_t io)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->client->pool_required_alignment(ctx->get_id());
+}
+
 extern "C" void rados_ioctx_locator_set_key(rados_ioctx_t io, const char *key)
 {
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
@@ -2474,11 +2505,18 @@ extern "C" int rados_ioctx_snap_remove(rados_ioctx_t io, const char *snapname)
   return ctx->snap_remove(snapname);
 }
 
-extern "C" int rados_rollback(rados_ioctx_t io, const char *oid,
+extern "C" int rados_ioctx_snap_rollback(rados_ioctx_t io, const char *oid,
 			      const char *snapname)
 {
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   return ctx->rollback(oid, snapname);
+}
+
+// Deprecated name kept for backward compatibility
+extern "C" int rados_rollback(rados_ioctx_t io, const char *oid,
+			      const char *snapname)
+{
+  return rados_ioctx_snap_rollback(io, oid, snapname);
 }
 
 extern "C" int rados_ioctx_selfmanaged_snap_create(rados_ioctx_t io,
@@ -3162,7 +3200,6 @@ extern "C" void rados_write_op_create(rados_write_op_t write_op,
 {
   ::ObjectOperation *oo = (::ObjectOperation *) write_op;
   if(category) {
-    std::string cpp_category = category;
     oo->create(exclusive, category);
   } else {
     oo->create(!!exclusive);

@@ -522,6 +522,14 @@ int rados_cluster_stat(rados_t cluster, struct rados_cluster_stat_t *result);
 int rados_cluster_fsid(rados_t cluster, char *buf, size_t len);
 
 /**
+ * Get/wait for the most recent osdmap
+ * 
+ * @param cluster the cluster to shutdown
+ * @returns 0 on sucess, negative error code on failure
+ */
+int rados_wait_for_latest_osdmap(rados_t cluster);
+
+/**
  * @defgroup librados_h_pools Pools
  *
  * RADOS pools are separate namespaces for objects. Pools may have
@@ -734,6 +742,9 @@ int rados_ioctx_pool_set_auid(rados_ioctx_t io, uint64_t auid);
  */
 int rados_ioctx_pool_get_auid(rados_ioctx_t io, uint64_t *auid);
 
+int rados_ioctx_pool_requires_alignment(rados_ioctx_t io);
+uint64_t rados_ioctx_pool_required_alignment(rados_ioctx_t io);
+
 /**
  * Get the pool id of the io context
  *
@@ -904,6 +915,20 @@ int rados_ioctx_snap_remove(rados_ioctx_t io, const char *snapname);
  * @param snapname which snapshot to rollback to
  * @returns 0 on success, negative error code on failure
  */
+int rados_ioctx_snap_rollback(rados_ioctx_t io, const char *oid,
+		   const char *snapname);
+
+/**
+ * Rollback an object to a pool snapshot *DEPRECATED*
+ *
+ * Deprecated interface which is not rados_ioctx_snap_rollback()
+ * This function could go away in the future
+ *
+ * @param io the pool in which the object is stored
+ * @param oid the name of the object to rollback
+ * @param snapname which snapshot to rollback to
+ * @returns 0 on success, negative error code on failure
+ */
 int rados_rollback(rados_ioctx_t io, const char *oid,
 		   const char *snapname);
 
@@ -1053,8 +1078,7 @@ uint64_t rados_get_last_version(rados_ioctx_t io);
  * @param buf data to write
  * @param len length of the data, in bytes
  * @param off byte offset in the object to begin writing at
- * @returns number of bytes written on success, negative error code on
- * failure
+ * @returns 0 on success, negative error code on failure
  */
 int rados_write(rados_ioctx_t io, const char *oid, const char *buf, size_t len, uint64_t off);
 
@@ -1100,8 +1124,7 @@ int rados_clone_range(rados_ioctx_t io, const char *dst, uint64_t dst_off,
  * @param oid the name of the object
  * @param buf the data to append
  * @param len length of buf (in bytes)
- * @returns number of bytes written on success, negative error code on
- * failure
+ * @returns 0 on success, negative error code on failure
  */
 int rados_append(rados_ioctx_t io, const char *oid, const char *buf, size_t len);
 
@@ -2279,7 +2302,7 @@ void rados_read_op_omap_get_vals_by_keys(rados_read_op_t read_op,
 					 int *prval);
 
 /**
- * Perform a write operation synchronously
+ * Perform a read operation synchronously
  * @param read_op operation to perform
  * @io the ioctx that the object is in
  * @oid the object id
@@ -2291,7 +2314,7 @@ int rados_read_op_operate(rados_read_op_t read_op,
 			  int flags);
 
 /**
- * Perform a write operation asynchronously
+ * Perform a read operation asynchronously
  * @param read_op operation to perform
  * @io the ioctx that the object is in
  * @param completion what to do when operation has been attempted
